@@ -62,12 +62,18 @@ Strict execution-based checker:
 
 ### Infrastructure Limitations
 
-Testing ISRA on weaker models (Qwen3.5-0.8B, Qwen3.6-27B) was attempted but encountered MLX server compatibility issues:
+Testing ISRA on weaker models was attempted but encountered MLX server compatibility issues:
+
+**Qwen family models:**
 - Qwen3.5-0.8B-draft: MLX server failed to respond (possible format incompatibility)
 - Qwen3.6-27B-abliterated-5bit-MLX: HTTP 404 errors on all requests (model not found by MLX)
 
+**Llama family models:**
+- Llama-3.1-8B-Instruct-3bit: Downloaded successfully (3.3GB), MLX server loads but doesn't respond to HTTP requests (connection refused)
+- Llama-3-8B-Instruct-8bit: Download failed due to HuggingFace connection issues
+
 The benchmarking infrastructure is currently optimized for Qwen3.6-35B-A3B-abliterated-mixed36 only. Testing the hypothesis that "ISRA helps weak models more than strong models" requires either:
-1. MLX-compatible conversions of smaller Qwen models
+1. MLX-compatible conversions of smaller models with correct tokenizers/configs
 2. Alternative backend (llama.cpp for GGUF models)
 3. Cloud-based testing on weaker models
 
