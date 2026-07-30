@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.qwen3-a3b</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON_BIN}}</string>
+    <string>-m</string>
+    <string>mlx_lm.server</string>
+    <string>--model</string>
+    <string>{{MODEL_PATH}}</string>
+    <string>--host</string>
+    <string>127.0.0.1</string>
+    <string>--port</string>
+    <string>8081</string>
+    <string>--max-kv-size</string>
+    <string>8192</string>
+    <string>--max-requests</string>
+    <string>4</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{HOME_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PYTHON_VENV_BIN}}:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/qwen3-a3b.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/qwen3-a3b.err.log</string>
+</dict>
+</plist>

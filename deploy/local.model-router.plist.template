@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.model-router</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>{{PYTHON_BIN}}</string>
+    <string>{{INSTALL_DIR}}/model_router.py</string>
+    <string>--host</string>
+    <string>0.0.0.0</string>
+    <string>--port</string>
+    <string>8080</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>{{INSTALL_DIR}}</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>{{PYTHON_VENV_BIN}}:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>{{LOG_DIR}}/model-router.log</string>
+  <key>StandardErrorPath</key>
+  <string>{{LOG_DIR}}/model-router.err.log</string>
+</dict>
+</plist>
