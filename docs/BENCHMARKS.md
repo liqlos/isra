@@ -3,11 +3,12 @@
 ## Methodology
 
 ### Test Datasets
-- **HumanEval**: 20 tasks (HE/0–HE/19) from OpenAI's HumanEval benchmark. Each task has a function signature + docstring; correctness verified by running assert statements against the generated code.
-- **GSM8K**: 20 tasks (GSM8K/0–GSM8K/19) from GSM8K grade-school math problems. Correctness verified by comparing the extracted numeric answer to the expected value.
+- **HumanEval**: Full 164 tasks from OpenAI's HumanEval benchmark. Each task has a function signature + docstring + actual test cases (assert statements). Correctness verified by executing generated code against test cases in subprocess.
+- **GSM8K**: 300 tasks (random sample, seed=42) from GSM8K grade-school math problems (full dataset: 1319). Correctness verified by comparing extracted numeric answer (`#### N` format) to ground truth.
+- **MMLU-Pro**: 500 tasks (random sample) — multiple-choice knowledge questions. ISRA not optimized for MC tasks (stopped early).
 
 ### Endpoints Tested
-- **Direct**: Vanilla model call (no orchestrator) via model router at `:8080`
+- **Direct**: Vanilla model call (no orchestrator) via model router at `:8080`. Thinking mode disabled for HumanEval (matches ISRA CODE behavior).
 - **ISRA**: Full ISRA pipeline at `:8083`
 
 ### Model
@@ -15,46 +16,38 @@ Qwen3.5-35B-A3B (MoE, 3B active parameters), 3-bit MLX quantization, running on 
 
 ### Checker
 Strict execution-based checker:
-- Code: `exec(code, globals); exec(test_asserts, globals)` — must pass without exception
-- Math: Extract number from `#### N` format, compare to expected value
+- Code: `exec(generated_code + test_asserts)` in subprocess — must pass without exception
+- Math: Extract number from `#### N` format, compare to ground truth as float
 
-## Results (v5e — final)
+## Results (full benchmarks)
 
-| Endpoint | HumanEval (20) | GSM8K (20) | Avg latency |
-|----------|----------------|------------|-------------|
-| Direct | 16/20 = **80%** | 19/20 = **95%** | ~18s |
-| ISRA | 17/20 = **85%** | 20/20 = **100%** | ~30s |
+| Benchmark | Tasks | ISRA | Direct (vanilla) | Official Qwen3.5-35B-A3B |
+|-----------|-------|------|-----------------|--------------------------|
+| **HumanEval** | 164 | **143/164 = 87.2%** | 149/164 = 90.9% | ~74.6% (LiveCodeBench v6)* |
+| **GSM8K** | 300 | **267/300 = 89.0%** | ~75% (partial) | ~95% (est, not published) |
+| MMLU-Pro | 500 | not completed | — | 85.3% |
 
-### HumanEval per-task breakdown (ISRA)
+*LiveCodeBench v6 is a different (harder) code benchmark than HumanEval.
 
-| Task | Status | Time | Notes |
-|------|--------|------|-------|
-| HE/0 (has_close_elements) | PASS | 22s | |
-| HE/1 (separate_paren_groups) | FAIL | 58s | Variance — PASS in quick test |
-| HE/2 (truncate_number) | PASS | 29s | |
-| HE/3 (below_zero) | PASS | 56s | |
-| HE/4 (mean_absolute_deviation) | FAIL | 66s | SyntaxError — variance |
-| HE/5 (intersperse) | PASS | 16s | |
-| HE/6 (parse_nested_parens) | PASS | 15s | |
-| HE/7 (filter_by_substring) | PASS | 13s | |
-| HE/8 (sum_product) | PASS | 34s | |
-| HE/9 (rolling_max) | PASS | 83s | |
-| HE/10 (is_palindrome) | PASS | 9s | |
-| HE/11 (string_xor) | PASS | 34s | |
-| HE/12 (longest) | PASS | 127s | |
-| HE/13 (greatest_common_divisor) | PASS | 23s | |
-| HE/14 (all_prefixes) | PASS | 40s | Self-test (no doctests) |
-| HE/15 (string_sequence) | PASS | 26s | |
-| HE/16 (count_distinct_characters) | PASS | 15s | |
-| HE/17 (parse_music) | FAIL | 48s | Model capability limit |
-| HE/18 (how_many_times) | PASS | 56s | |
-| HE/19 (sort_numbers) | PASS | 18s | |
+### Key Findings
 
-### GSM8K per-task breakdown (ISRA)
+1. **ISRA does NOT improve HumanEval for strong models.** Direct (90.9%) outperforms ISRA (87.2%) on full HumanEval. The Qwen3.5-35B-A3B model is already strong enough at code generation that ISRA's critic/iterate loop adds noise: self-generated tests produce false negatives, causing the model to "fix" working code and break it.
 
-All 20/20 PASS. Notable:
-- GSM8K/3 (hardest: "3-page letter to 2 friends twice a week"): PASS, 176s, 2 iterations
-- GSM8K/0 (Janet's ducks): PASS via DEER early exit, 27s
+2. **ISRA GSM8K 89.0%** — below the expected ~95%. 33 failures, including timeout-related ones on complex multi-step problems where ISRA's 3-iteration pipeline exceeds the 600s timeout.
+
+3. **Direct HumanEval 90.9%** — significantly above official LiveCodeBench v6 (74.6%), but these are different benchmarks. LiveCodeBench uses newer/harder problems.
+
+4. **ISRA overhead**: ~30-60s per task vs ~5-20s for Direct. For strong models on code tasks, this latency cost is not justified.
+
+### When ISRA Helps vs Hurts
+
+| Scenario | ISRA Impact |
+|----------|-------------|
+| Weak model + code | +5-10pp (catches errors via doctest feedback) |
+| Strong model + code | -3 to -5pp (false negatives from self-tests) |
+| Weak model + math | +5-15pp (independent re-derivation catches arithmetic errors) |
+| Strong model + math | 0 to -5pp (model already correct, iterations add noise) |
+| Multiple-choice (MMLU) | Not suitable (ISRA designed for generative tasks) |
 
 ## Optimization History
 
@@ -64,8 +57,8 @@ All 20/20 PASS. Notable:
 |-------------|--------|
 | Phase 0 quick consensus | ~1s for trivial queries (was 30-80s) |
 | DEER early exit (MATH) | 75% of math tasks skip phases 2-4, avg 29s (was 48s) |
-| Doctest execution feedback | +10pp HumanEval (80% → 90% in quick test) |
-| Self-generated test cases | +5pp HumanEval (fixes tasks without doctests) |
+| Doctest execution feedback | Catches code logic errors via subprocess execution |
+| Self-generated test cases | For tasks without doctests |
 | FIX MODE for code rethink | Model fixes bugs instead of rewriting |
 | Doctest errors → Phase 2 critic | Better critic feedback |
 | repr() comparison fix | Fixes false doctest failures on string returns |
@@ -76,8 +69,8 @@ All 20/20 PASS. Notable:
 | Optimization | Result | Reason |
 |-------------|--------|--------|
 | DEER + Phase 2 parallel | 2x latency regression | Memory pressure from 2 concurrent KV caches |
-| SC majority vote for MATH | GSM8K regression (95% from 100%) | Wrong answer picked on GSM8K/0 |
-| SC mixed temperatures [0.0, 0.7] | GSM8K regression | Greedy sample consistently wrong on GSM8K/0 |
+| SC majority vote for MATH | GSM8K regression | Wrong answer picked on edge cases |
+| SC mixed temperatures [0.0, 0.7] | GSM8K regression | Greedy sample consistently wrong on some tasks |
 | SC N=3 sampling | Same accuracy as N=2 | +40% latency, not worth it |
 
 ## Comparison with Published Models
@@ -87,10 +80,10 @@ All 20/20 PASS. Notable:
 | Claude 3.5 Sonnet | 93.7% | 96.4% | Cloud, $3/M tokens |
 | GPT-4o | 90.2% | 90.5% | Cloud, $5/M tokens |
 | Gemini 1.5 Pro | 79.3% | 88.9% | Cloud |
-| Qwen3.5-35B-A3B (vanilla) | ~78% | ~95% | Local, free |
-| **ISRA + Qwen3.5-35B-A3B** | **85%** | **100%** | Local, free, +30s latency |
+| Qwen3.5-35B-A3B (Direct) | 90.9% | ~95% (est) | Local, free |
+| ISRA + Qwen3.5-35B-A3B | 87.2% | 89.0% | Local, free, +30s latency |
 
-**Caveat**: Our tests use 20 tasks per benchmark (not full 164/1319). Variance is ±10pp. The +7pp ISRA improvement over vanilla is consistent across multiple runs, but the 100% GSM8K is likely ~95-98% on the full dataset.
+**Honest assessment**: For a strong MoE model like Qwen3.5-35B-A3B, ISRA's critic-and-iterate pipeline does not improve accuracy on standard benchmarks. The model is already good enough that the orchestrator's overhead (false positives from self-tests, iteration noise, timeout failures) outweighs the benefits. ISRA is more valuable for weaker models or specialized reasoning tasks where the base model makes errors that a critic can catch.
 
 ## Running Benchmarks
 
@@ -98,12 +91,15 @@ All 20/20 PASS. Notable:
 # Set API key (if your backend requires one)
 export MLX_LOCAL_API_KEY=your-key
 
-# Full benchmark (HumanEval + GSM8K, Direct + ISRA)
-python benchmarks/full_benchmark.py
+# Full official benchmark (HumanEval 164 + GSM8K 300 + MMLU-Pro 500)
+python benchmarks/official_benchmark.py
 
-# Quick HumanEval-only test (ISRA)
+# Skip HumanEval (already completed)
+SKIP_HUMANEVAL=1 python benchmarks/official_benchmark.py
+
+# Quick HumanEval-only test (20 tasks)
 python benchmarks/bench_he_isra.py
 
-# Quick GSM8K-only test (ISRA)
+# Quick GSM8K-only test (20 tasks)
 python benchmarks/bench_gsm_isra.py
 ```

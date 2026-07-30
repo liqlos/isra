@@ -22,19 +22,18 @@ If the critic finds errors, ISRA **iterates** — re-running Phase 1 with the cr
 
 ## Benchmark Results
 
-Tested with Qwen3.5-35B-A3B (3-bit MLX, local Mac mini M4):
+Tested with Qwen3.5-35B-A3B (3-bit MLX, local Mac mini M4) on full official benchmarks:
 
-| Endpoint | HumanEval (20) | GSM8K (20) | Avg latency |
-|----------|----------------|------------|-------------|
-| Direct (vanilla model) | 80% | 95% | ~18s |
-| **ISRA** | **85%** (up to 95%) | **100%** | ~30s |
+| Benchmark | Tasks | ISRA | Direct (vanilla) | Official Qwen3.5-35B-A3B |
+|-----------|-------|------|-----------------|--------------------------|
+| HumanEval | 164 | 143/164 = 87.2% | 149/164 = 90.9% | ~74.6% (LiveCodeBench v6)* |
+| GSM8K | 300 | 267/300 = 89.0% | ~75% (partial) | ~95% (est) |
 
-For comparison (published numbers, full datasets):
-- Claude 3.5 Sonnet: HumanEval 93.7%, GSM8K 96.4%
-- GPT-4o: HumanEval 90.2%, GSM8K 90.5%
-- Qwen3.5-35B-A3B (vanilla, estimated): HumanEval ~78%
+*LiveCodeBench v6 is a different (harder) code benchmark than HumanEval.
 
-ISRA adds **+7-15pp** to the base model's accuracy for free (local, no API costs).
+**Honest finding**: For a strong MoE model like Qwen3.5-35B-A3B, ISRA does NOT improve accuracy on standard benchmarks. The base model is already good enough that the orchestrator's overhead (self-test false negatives, iteration noise, timeout failures) outweighs the benefits. ISRA is more valuable for weaker models or specialized reasoning tasks.
+
+See [docs/BENCHMARKS.md](docs/BENCHMARKS.md) for full methodology and analysis.
 
 ## Key Features
 
