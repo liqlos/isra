@@ -60,6 +60,19 @@ Strict execution-based checker:
 | Strong model + math | 0 to -5pp (model already correct, iterations add noise) |
 | Strong model + MC | Bypassed (fast-path) — no overhead, same as Direct |
 
+### Infrastructure Limitations
+
+Testing ISRA on weaker models (Qwen3.5-0.8B, Qwen3.6-27B) was attempted but encountered MLX server compatibility issues:
+- Qwen3.5-0.8B-draft: MLX server failed to respond (possible format incompatibility)
+- Qwen3.6-27B-abliterated-5bit-MLX: HTTP 404 errors on all requests (model not found by MLX)
+
+The benchmarking infrastructure is currently optimized for Qwen3.6-35B-A3B-abliterated-mixed36 only. Testing the hypothesis that "ISRA helps weak models more than strong models" requires either:
+1. MLX-compatible conversions of smaller Qwen models
+2. Alternative backend (llama.cpp for GGUF models)
+3. Cloud-based testing on weaker models
+
+Current results are based on a single strong model (35B MoE), where ISRA shows minimal or negative impact.
+
 ## Optimization History (v2 updates)
 
 ### Implemented (v2)
