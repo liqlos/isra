@@ -19,39 +19,62 @@ Strict execution-based checker:
 - Code: `exec(generated_code + test_asserts)` in subprocess — must pass without exception
 - Math: Extract number from `#### N` format, compare to ground truth as float
 
-## Results (full benchmarks)
+## Results (v2 — with max_tokens=4096, top_k=20, presence_penalty, \boxed{} support, MC fast-path)
 
-| Benchmark | Tasks | ISRA | Direct (vanilla) | Official Qwen3.5-35B-A3B |
-|-----------|-------|------|-----------------|--------------------------|
-| **HumanEval** | 164 | **143/164 = 87.2%** | 149/164 = 90.9% | ~74.6% (LiveCodeBench v6)* |
-| **GSM8K** | 300 | **267/300 = 89.0%** | ~75% (partial) | ~95% (est, not published) |
-| MMLU-Pro | 500 | not completed | — | 85.3% |
+| Benchmark | Tasks | ISRA (v2) | ISRA (v1) | Direct (vanilla) | Official Qwen3.5-35B-A3B |
+|-----------|-------|-----------|-----------|-----------------|--------------------------|
+| **HumanEval** | 164 | **146/164 = 89.0%** | 143/164 = 87.2% | 149/164 = 90.9% | ~74.6% (LiveCodeBench v6)* |
+| GSM8K | 300 | not completed (timeout/502) | 267/300 = 89.0% | ~75% (partial) | не опубликован |
+| MMLU-Pro | 500 | not completed | — | — | 85.3% |
 
 *LiveCodeBench v6 is a different (harder) code benchmark than HumanEval.
 
-### Key Findings
+### Key Findings (v2)
 
-1. **ISRA does NOT improve HumanEval for strong models.** Direct (90.9%) outperforms ISRA (87.2%) on full HumanEval. The Qwen3.5-35B-A3B model is already strong enough at code generation that ISRA's critic/iterate loop adds noise: self-generated tests produce false negatives, causing the model to "fix" working code and break it.
+1. **ISRA improved from 87.2% to 89.0% on HumanEval** (+1.8pp) after fixes:
+   - max_tokens raised 2000→4096 (8K caused 600s timeouts on GSM8K)
+   - top_k=20 added per Qwen thinking-mode spec
+   - presence_penalty added (0.0 for code, 1.5 for general)
+   - Phase 4 temp raised 0.2→0.6 (Qwen recommends 0.6+ for thinking mode)
+   - \boxed{} support added to extraction (Qwen3.5 trained on \boxed{} format)
+   - MC fast-path added (bypass 11-call pipeline for multiple-choice)
 
-2. **ISRA GSM8K 89.0%** — below the expected ~95%. 33 failures, including timeout-related ones on complex multi-step problems where ISRA's 3-iteration pipeline exceeds the 600s timeout.
+2. **ISRA still below Direct (90.9%)** on HumanEval. The 1.9pp gap is due to:
+   - Iteration noise: self-generated tests produce false negatives, causing model to "fix" working code
+   - Temperature confound: ISRA uses temp=0.6 for Phase 1 (matches Qwen spec), Direct uses temp=0 (greedy)
+   - Overhead: ISRA's multi-phase pipeline adds latency without accuracy gain for strong models
 
-3. **Direct HumanEval 90.9%** — significantly above official LiveCodeBench v6 (74.6%), but these are different benchmarks. LiveCodeBench uses newer/harder problems.
+3. **GSM8K not completed with max_tokens=4096** — still encountering timeouts/502 errors. The 89.0% v1 result stands.
 
-4. **ISRA overhead**: ~30-60s per task vs ~5-20s for Direct. For strong models on code tasks, this latency cost is not justified.
+4. **MMLU-Pro not completed** — MC fast-path added but benchmark not run due to MLX server instability.
 
-### When ISRA Helps vs Hurts
+5. **Official Qwen3.5-35B-A3B does not publish GSM8K/HumanEval/MATH** — uses HMMT, LiveCodeBench v6, SWE-bench instead.
+
+### When ISRA Helps vs Hurts (updated)
 
 | Scenario | ISRA Impact |
 |----------|-------------|
 | Weak model + code | +5-10pp (catches errors via doctest feedback) |
-| Strong model + code | -3 to -5pp (false negatives from self-tests) |
+| Strong model + code | -2 to -4pp (false negatives from self-tests, iteration noise) |
 | Weak model + math | +5-15pp (independent re-derivation catches arithmetic errors) |
 | Strong model + math | 0 to -5pp (model already correct, iterations add noise) |
-| Multiple-choice (MMLU) | Not suitable (ISRA designed for generative tasks) |
+| Strong model + MC | Bypassed (fast-path) — no overhead, same as Direct |
 
-## Optimization History
+## Optimization History (v2 updates)
 
-### Implemented (kept)
+### Implemented (v2)
+
+| Optimization | Impact |
+|-------------|--------|
+| max_tokens 2000→4096 | Prevents code truncation, but 8K caused timeouts |
+| top_k=20 added | Matches Qwen thinking-mode spec |
+| presence_penalty added | Prevents repetition loops |
+| Phase 4 temp 0.2→0.6 | Matches Qwen spec (recommends 0.6+ for thinking mode) |
+| \boxed{} extraction | Qwen3.5 trained on \boxed{} format |
+| MC fast-path | Bypasses 11-call pipeline for multiple-choice (prevents 320s timeouts) |
+| extract_mmlu_answer() fix | Check "answer is X" first (was checking first letter in prose) |
+
+### Implemented (v1 - kept)
 
 | Optimization | Impact |
 |-------------|--------|
@@ -72,6 +95,7 @@ Strict execution-based checker:
 | SC majority vote for MATH | GSM8K regression | Wrong answer picked on edge cases |
 | SC mixed temperatures [0.0, 0.7] | GSM8K regression | Greedy sample consistently wrong on some tasks |
 | SC N=3 sampling | Same accuracy as N=2 | +40% latency, not worth it |
+| max_tokens 4096→8192 | HumanEval 89.0% → 89.0% (no gain), GSM8K timeouts | 8K caused 600s timeouts on complex tasks |
 
 ## Comparison with Published Models
 
@@ -81,7 +105,7 @@ Strict execution-based checker:
 | GPT-4o | 90.2% | 90.5% | Cloud, $5/M tokens |
 | Gemini 1.5 Pro | 79.3% | 88.9% | Cloud |
 | Qwen3.5-35B-A3B (Direct) | 90.9% | ~95% (est) | Local, free |
-| ISRA + Qwen3.5-35B-A3B | 87.2% | 89.0% | Local, free, +30s latency |
+| ISRA v2 + Qwen3.5-35B-A3B | 89.0% | 89.0% (v1) | Local, free, +30s latency |
 
 **Honest assessment**: For a strong MoE model like Qwen3.5-35B-A3B, ISRA's critic-and-iterate pipeline does not improve accuracy on standard benchmarks. The model is already good enough that the orchestrator's overhead (false positives from self-tests, iteration noise, timeout failures) outweighs the benefits. ISRA is more valuable for weaker models or specialized reasoning tasks where the base model makes errors that a critic can catch.
 
