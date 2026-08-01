@@ -1,0 +1,18 @@
+# The base is the already pinned EvalPlus image built from Dockerfile.evalplus.
+# Its local image ID and the resulting image digest are recorded in each run
+# manifest; this file pins the independently versioned official LCB source.
+FROM isra-evalplus:0.3.1
+
+ARG LIVE_CODE_BENCH_REV=28fef95ea8c9f7a547c8329f2cd3d32b92c1fa24
+
+RUN git clone https://github.com/LiveCodeBench/LiveCodeBench.git /opt/livecodebench \
+    && git -C /opt/livecodebench checkout "$LIVE_CODE_BENCH_REV" \
+    && test -z "$(git -C /opt/livecodebench status --porcelain)"
+
+ENV PYTHONPATH=/workspace:/opt/livecodebench \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TOKENIZERS_PARALLELISM=false
+
+WORKDIR /opt/livecodebench
+
+ENTRYPOINT ["python"]
