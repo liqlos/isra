@@ -32,6 +32,7 @@ import logging
 import os
 import re
 import ast
+import contextvars
 import sys
 import time
 import uuid
@@ -80,6 +81,19 @@ BACKEND_TIMEOUT = ClientTimeout(total=420, sock_read=180)
 SESSION_TTL = int(os.environ.get("ISRA_SESSION_TTL", "3600"))  # 1 hour
 _sessions: dict[str, dict] = {}
 _sessions_lock = asyncio.Lock()
+
+# Per-request benchmark instrumentation. Context variables keep concurrent
+# requests isolated without changing the orchestration prompts or default
+# sampling policy used by normal clients.
+_request_temperature_override: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "isra_request_temperature_override", default=None
+)
+_request_seed: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "isra_request_seed", default=None
+)
+_request_phase_metrics: contextvars.ContextVar[list[dict] | None] = contextvars.ContextVar(
+    "isra_request_phase_metrics", default=None
+)
 
 
 def _get_session(session_id: str) -> dict:
@@ -302,6 +316,150 @@ def run_doctest_examples(code: str, examples: list) -> tuple[bool, str]:
     if failures:
         return False, f"[DOCSTRING_TEST_FAILED] {len(failures)} of {len(examples)} tests failed: {'; '.join(failures[:3])}"
     return True, ""
+
+
+def verify_code_with_trusted_checks(user_query: str, code: str) -> dict[str, Any]:
+    """Verify one candidate using only deterministic, task-provided evidence.
+
+    Self-generated tests are deliberately excluded. A compile-only pass means
+    the candidate is executable, not semantically verified.
+    """
+    result: dict[str, Any] = {
+        "code_present": bool(code.strip()),
+        "syntax_ok": False,
+        "public_tests_available": False,
+        "public_tests_total": 0,
+        "public_tests_passed": 0,
+        "failed_test_ids": [],
+        "failures": [],
+        "actionable_failure": False,
+        "passed": False,
+        "semantic_verified": False,
+    }
+    if not code.strip():
+        result["actionable_failure"] = True
+        result["failures"] = [
+            {
+                "id": "candidate:missing",
+                "kind": "missing_code",
+                "message": "No executable Python candidate was extracted.",
+            }
+        ]
+        result["failed_test_ids"] = ["candidate:missing"]
+        return result
+
+    try:
+        compile(code, "<candidate>", "exec")
+    except SyntaxError as exc:
+        failure = {
+            "id": "compile:syntax",
+            "kind": "syntax_error",
+            "message": f"SyntaxError: {exc.msg} at line {exc.lineno}",
+        }
+        result["actionable_failure"] = True
+        result["failures"] = [failure]
+        result["failed_test_ids"] = [failure["id"]]
+        return result
+
+    result["syntax_ok"] = True
+    examples = extract_doctest_examples(user_query)
+    result["public_tests_available"] = bool(examples)
+    result["public_tests_total"] = len(examples)
+    if not examples:
+        result["passed"] = True
+        return result
+
+    import subprocess
+
+    failures: list[dict[str, Any]] = []
+    passed = 0
+    for index, (expr, expected) in enumerate(examples):
+        test_id = f"public_example:{index}"
+        test_script = (
+            code
+            + f"\n\n_result = repr({expr})\n"
+            + f"_expected = {expected!r}\n"
+            + "assert _result == _expected, "
+            + "f'Got {_result}, expected {_expected}'\n"
+        )
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-I", "-c", test_script],
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except subprocess.TimeoutExpired:
+            failures.append(
+                {
+                    "id": test_id,
+                    "kind": "timeout",
+                    "expression": expr,
+                    "expected_repr": expected,
+                    "message": "Public example timed out after 5 seconds.",
+                }
+            )
+        except Exception as exc:
+            failures.append(
+                {
+                    "id": test_id,
+                    "kind": "runner_error",
+                    "expression": expr,
+                    "expected_repr": expected,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+        else:
+            if completed.returncode == 0:
+                passed += 1
+            else:
+                stderr = completed.stderr.strip()
+                message = stderr.splitlines()[-1] if stderr else "public example failed"
+                failures.append(
+                    {
+                        "id": test_id,
+                        "kind": "public_example_failure",
+                        "expression": expr,
+                        "expected_repr": expected,
+                        "message": message[:500],
+                    }
+                )
+
+    result["public_tests_passed"] = passed
+    result["failures"] = failures
+    result["failed_test_ids"] = [failure["id"] for failure in failures]
+    result["actionable_failure"] = bool(failures)
+    result["passed"] = not failures
+    result["semantic_verified"] = not failures
+    return result
+
+
+def compare_trusted_verification(
+    original: dict[str, Any], candidate: dict[str, Any]
+) -> tuple[bool, str]:
+    """Accept only a candidate that clears every available trusted failure."""
+    if not candidate.get("code_present"):
+        return False, "candidate_missing"
+    if not original.get("syntax_ok"):
+        if not candidate.get("syntax_ok"):
+            return False, "syntax_not_repaired"
+        if candidate.get("failed_test_ids"):
+            return False, "syntax_repaired_but_trusted_tests_fail"
+        return True, "syntax_repaired"
+    if not candidate.get("syntax_ok"):
+        return False, "candidate_introduced_syntax_error"
+
+    original_failed = set(original.get("failed_test_ids", []))
+    candidate_failed = set(candidate.get("failed_test_ids", []))
+    if not original_failed:
+        return False, "original_had_no_trusted_failure"
+    if not candidate_failed:
+        return True, "trusted_suite_passed"
+    if candidate_failed - original_failed:
+        return False, "candidate_introduced_trusted_failure"
+    if candidate_failed < original_failed:
+        return False, "trusted_failures_reduced_but_not_cleared"
+    return False, "no_strict_trusted_improvement"
 
 
 def _parse_bullets(text: str) -> list[str]:
@@ -580,6 +738,24 @@ RULES:
 7. If the query asks for a numeric/math answer, output the final number clearly (e.g., "#### 42" for GSM8K-style, or just the number).
 8. Do NOT include commentary about the code, the reasoning process, or "here is the solution". Output ONLY what the user asked for."""
 
+# Literature-backed code variants. These prompts are separate treatments; the
+# legacy ISRA prompts above remain unchanged and are still the default baseline.
+CODE_PIPELINE_VARIANTS = {
+    "legacy_isra",
+    "phase1_only",
+    "phase1_unguided_retry",
+    "grounded_one_repair",
+}
+
+GROUNDED_REPAIR_SYSTEM = """You are a precise Python code repair assistant.
+
+You will receive an original task, an immutable candidate, and a failure observed
+by a trusted compiler or a public example supplied in the task. Make the smallest
+change that fixes that exact failure while preserving the function signature and
+all other behavior. Do not invent tests or expected outputs. Do not rewrite
+unrelated parts. Return only the complete repaired program in one fenced Python
+code block."""
+
 # ─── Parsing helpers (regex with fallback defaults) ─────────────────────────
 
 def extract_tag(text: str, tag: str) -> str | None:
@@ -846,6 +1022,9 @@ async def call_backend(
     stream: bool = False,
     enable_thinking_override: bool | None = None,
     temp_override: float | None = None,
+    role_temperature_override: float | None = None,
+    seed_override: int | None = None,
+    metric_role: str | None = None,
 ) -> str:
     """Call the model router for a single phase. Returns full text output.
     enable_thinking_override: if set, overrides PHASE_PARAMS[phase]["enable_thinking"].
@@ -855,7 +1034,16 @@ async def call_backend(
     Uses shared session with force_close connector to prevent memory accumulation."""
     params = PHASE_PARAMS[phase]
     thinking_enabled = enable_thinking_override if enable_thinking_override is not None else params.get("enable_thinking", True)
-    temp = temp_override if temp_override is not None else params["temperature"]
+    request_temp_override = _request_temperature_override.get()
+    temp = (
+        role_temperature_override
+        if role_temperature_override is not None
+        else request_temp_override
+        if request_temp_override is not None
+        else temp_override
+        if temp_override is not None
+        else params["temperature"]
+    )
     body = {
         "model": BACKEND_MODEL,
         "messages": [
@@ -867,11 +1055,28 @@ async def call_backend(
         "max_tokens": params["max_tokens"],
         "stream": False,  # always non-stream for phases (need full output to parse)
     }
+    request_seed = seed_override if seed_override is not None else _request_seed.get()
+    if request_seed is not None:
+        body["seed"] = request_seed
     # Disable thinking mode for phases 2-4 (saves tokens, structured output only)
     if not thinking_enabled:
         body["chat_template_kwargs"] = {"enable_thinking": False}
 
     url = f"{ROUTER_URL}/v1/chat/completions"
+    started = time.perf_counter()
+    metric: dict[str, Any] = {
+        "phase": phase,
+        "temperature": temp,
+        "max_tokens": params["max_tokens"],
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "finish_reason": None,
+        "status": "transport_error",
+    }
+    if metric_role is not None:
+        metric["role"] = metric_role
+    if request_seed is not None:
+        metric["seed"] = request_seed
     try:
         # Use urllib instead of aiohttp to avoid memory accumulation in aiohttp connection pool
         import urllib.request
@@ -887,6 +1092,11 @@ async def call_backend(
         if not choices:
             raise RuntimeError("Backend returned no choices")
         msg = choices[0].get("message", {})
+        usage = data.get("usage", {}) or {}
+        metric["prompt_tokens"] = int(usage.get("prompt_tokens", 0) or 0)
+        metric["completion_tokens"] = int(usage.get("completion_tokens", 0) or 0)
+        metric["finish_reason"] = choices[0].get("finish_reason")
+        metric["status"] = "completed"
         content = msg.get("content", "")
         reasoning = msg.get("reasoning", "") or msg.get("reasoning_content", "")
         # Combine: reasoning (thinking) + content (answer)
@@ -900,11 +1110,19 @@ async def call_backend(
         del data, choices, msg
         return result
     except asyncio.TimeoutError:
+        metric["status"] = "timeout"
         log.error(f"Phase {phase} backend timeout")
         raise RuntimeError(f"Phase {phase} timed out")
     except Exception as e:
+        metric["error"] = f"{type(e).__name__}: {e}"[:300]
         log.error(f"Phase {phase} backend exception: {e}")
         raise
+    finally:
+        metric["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        metrics = _request_phase_metrics.get()
+        if metrics is not None:
+            metric["call_index"] = len(metrics) + 1
+            metrics.append(metric)
 
 
 async def stream_backend(
@@ -917,23 +1135,38 @@ async def stream_backend(
     """Call backend with streaming and forward chunks to write_chunk callback.
     Returns the full accumulated text."""
     params = PHASE_PARAMS[phase]
+    request_temp_override = _request_temperature_override.get()
+    temperature = request_temp_override if request_temp_override is not None else params["temperature"]
     body = {
         "model": BACKEND_MODEL,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
         ],
-        "temperature": params["temperature"],
+        "temperature": temperature,
         "top_p": params["top_p"],
         "max_tokens": params["max_tokens"],
         "stream": True,
     }
+    request_seed = _request_seed.get()
+    if request_seed is not None:
+        body["seed"] = request_seed
     # Disable thinking for Phase 4 (streaming final answer, no thinking needed)
     if not params.get("enable_thinking", True):
         body["chat_template_kwargs"] = {"enable_thinking": False}
 
     url = f"{ROUTER_URL}/v1/chat/completions"
     full_text = []
+    started = time.perf_counter()
+    metric: dict[str, Any] = {
+        "phase": phase,
+        "temperature": temperature,
+        "max_tokens": params["max_tokens"],
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "finish_reason": None,
+        "status": "transport_error",
+    }
     try:
         async with session.post(url, json=body, timeout=BACKEND_TIMEOUT) as resp:
             if resp.status != 200:
@@ -957,15 +1190,26 @@ async def stream_backend(
                             await write_chunk(content)
                     except json.JSONDecodeError:
                         continue
+        metric["status"] = "completed"
+    except asyncio.TimeoutError:
+        metric["status"] = "timeout"
+        raise
     except Exception as e:
+        metric["error"] = f"{type(e).__name__}: {e}"[:300]
         log.error(f"Phase {phase} stream exception: {e}")
         raise
+    finally:
+        metric["latency_ms"] = round((time.perf_counter() - started) * 1000, 3)
+        metrics = _request_phase_metrics.get()
+        if metrics is not None:
+            metric["call_index"] = len(metrics) + 1
+            metrics.append(metric)
     return "".join(full_text)
 
 
 # ─── ISRA Pipeline ──────────────────────────────────────────────────────────
 
-async def run_isra_pipeline(
+async def _run_isra_pipeline_impl(
     session: ClientSession,
     user_query: str,
     conversation_context: str = "",
@@ -1575,6 +1819,226 @@ async def run_isra_pipeline(
     }
 
 
+def derive_role_seed(seed: int | None, role: str) -> int | None:
+    """Derive stable, distinct backend seeds for independent mechanism roles."""
+    if seed is None:
+        return None
+    digest = hashlib.sha256(f"{int(seed)}\0{role}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:4], "big") & 0x7FFFFFFF
+
+
+def phase1_first_turn_prompt(user_query: str) -> str:
+    """Return the exact first-turn user prompt used by legacy Phase 1."""
+    return (
+        f"USER QUERY: {user_query}\n\n"
+        "PREVIOUS INSIGHTS (VERIFIED):\n(none — first iteration)\n\n"
+        "PREVIOUS CRITIQUE / FOCUS AREAS:\n(none — first iteration)"
+    )
+
+
+def grounded_repair_prompt(
+    user_query: str,
+    candidate: str,
+    verification: dict[str, Any],
+) -> str:
+    evidence = json.dumps(
+        verification.get("failures", []), ensure_ascii=False, sort_keys=True, indent=2
+    )
+    return (
+        f"ORIGINAL TASK:\n{user_query}\n\n"
+        f"IMMUTABLE CANDIDATE A:\n```python\n{candidate}\n```\n\n"
+        f"TRUSTED FAILURE EVIDENCE:\n{evidence}\n\n"
+        "Return the complete repaired program. Fix only failures supported by the evidence."
+    )
+
+
+async def _run_code_pipeline_variant_impl(
+    session: ClientSession,
+    user_query: str,
+    *,
+    variant: str,
+    initial_candidate: str | None,
+    seed: int | None,
+    repair_temperature: float | None,
+    stream_final: bool,
+    write_chunk,
+) -> dict[str, Any]:
+    """Run an isolated code mechanism variant without legacy session state."""
+    started = time.time()
+    if classify_task(user_query) != "CODE":
+        raise ValueError(f"{variant} currently supports CODE tasks only")
+
+    initial_raw = ""
+    provided_initial = initial_candidate is not None
+    if provided_initial:
+        candidate_a = str(initial_candidate)
+    else:
+        initial_raw = await call_backend(
+            session,
+            PHASE1_SYSTEM_CODE,
+            phase1_first_turn_prompt(user_query),
+            phase=1,
+            enable_thinking_override=False,
+            seed_override=derive_role_seed(seed, "proposer"),
+            metric_role="proposer",
+        )
+        candidate_a = parse_code(initial_raw)
+
+    verification_a = verify_code_with_trusted_checks(user_query, candidate_a)
+    candidate_b = ""
+    second_raw = ""
+    second_call_made = False
+    verification_b: dict[str, Any] | None = None
+    accepted = False
+    selection_reason = "phase1_only"
+    termination_reason = "PHASE1_ONLY"
+
+    if variant == "phase1_only":
+        selected = candidate_a
+    elif not verification_a["actionable_failure"]:
+        selected = candidate_a
+        selection_reason = "original_had_no_trusted_failure"
+        termination_reason = "NO_TRUSTED_FAILURE"
+    else:
+        if variant == "phase1_unguided_retry":
+            second_call_made = True
+            second_raw = await call_backend(
+                session,
+                PHASE1_SYSTEM_CODE,
+                phase1_first_turn_prompt(user_query),
+                phase=1,
+                enable_thinking_override=False,
+                seed_override=derive_role_seed(seed, "unguided_retry"),
+                metric_role="unguided_retry",
+            )
+            candidate_b = parse_code(second_raw)
+            accepted_label = "RETRY_ACCEPTED"
+            rollback_label = "RETRY_ROLLBACK"
+        elif variant == "grounded_one_repair":
+            second_call_made = True
+            second_raw = await call_backend(
+                session,
+                GROUNDED_REPAIR_SYSTEM,
+                grounded_repair_prompt(user_query, candidate_a, verification_a),
+                phase=1,
+                enable_thinking_override=False,
+                role_temperature_override=repair_temperature,
+                seed_override=derive_role_seed(seed, "grounded_repair"),
+                metric_role="grounded_repair",
+            )
+            candidate_b = parse_code(second_raw)
+            accepted_label = "REPAIR_ACCEPTED"
+            rollback_label = "REPAIR_ROLLBACK"
+        else:
+            raise ValueError(f"unsupported code pipeline variant: {variant}")
+
+        verification_b = verify_code_with_trusted_checks(user_query, candidate_b)
+        accepted, selection_reason = compare_trusted_verification(
+            verification_a, verification_b
+        )
+        selected = candidate_b if accepted else candidate_a
+        termination_reason = accepted_label if accepted else rollback_label
+
+    if stream_final and write_chunk:
+        await write_chunk(selected)
+
+    elapsed = time.time() - started
+    return {
+        "final_answer": selected,
+        "iterations": 1 + int(second_call_made),
+        "elapsed_seconds": round(elapsed, 3),
+        "termination_reason": termination_reason,
+        "variant": variant,
+        "candidate_trace": {
+            "provided_initial_candidate": provided_initial,
+            "candidate_a": candidate_a,
+            "candidate_a_raw_response": initial_raw,
+            "verification_a": verification_a,
+            "candidate_b": candidate_b or None,
+            "candidate_b_raw_response": second_raw or None,
+            "verification_b": verification_b,
+            "selected": "B" if accepted else "A",
+            "selection_reason": selection_reason,
+        },
+    }
+
+
+async def run_isra_pipeline(
+    session: ClientSession,
+    user_query: str,
+    conversation_context: str = "",
+    session_state: dict | None = None,
+    stream_final: bool = False,
+    write_chunk=None,
+    benchmark_temperature_override: float | None = None,
+    seed: int | None = None,
+    variant: str = "legacy_isra",
+    initial_candidate: str | None = None,
+    repair_temperature: float | None = None,
+) -> dict[str, Any]:
+    """Run the frozen legacy pipeline or an explicitly selected code variant.
+
+    The default remains legacy ISRA. Benchmark controls and new variants are
+    request-local and do not mutate shared prompts or configuration.
+    """
+    if benchmark_temperature_override is not None:
+        benchmark_temperature_override = float(benchmark_temperature_override)
+        if not 0.0 <= benchmark_temperature_override <= 2.0:
+            raise ValueError("benchmark temperature override must be between 0 and 2")
+    if seed is not None:
+        seed = int(seed)
+    if variant not in CODE_PIPELINE_VARIANTS:
+        raise ValueError(
+            f"unknown isra_variant {variant!r}; expected one of {sorted(CODE_PIPELINE_VARIANTS)}"
+        )
+    if initial_candidate is not None and not isinstance(initial_candidate, str):
+        raise ValueError("isra_initial_candidate must be a string")
+    if initial_candidate is not None and len(initial_candidate) > 200_000:
+        raise ValueError("isra_initial_candidate exceeds 200000 characters")
+    if repair_temperature is not None:
+        repair_temperature = float(repair_temperature)
+        if not 0.0 <= repair_temperature <= 2.0:
+            raise ValueError("isra_repair_temperature must be between 0 and 2")
+    if variant == "legacy_isra" and initial_candidate is not None:
+        raise ValueError("legacy_isra does not accept an injected initial candidate")
+
+    metrics: list[dict] = []
+    temp_token = _request_temperature_override.set(benchmark_temperature_override)
+    seed_token = _request_seed.set(seed)
+    metrics_token = _request_phase_metrics.set(metrics)
+    try:
+        if variant == "legacy_isra":
+            result = await _run_isra_pipeline_impl(
+                session,
+                user_query,
+                conversation_context=conversation_context,
+                session_state=session_state,
+                stream_final=stream_final,
+                write_chunk=write_chunk,
+            )
+            result["variant"] = variant
+        else:
+            result = await _run_code_pipeline_variant_impl(
+                session,
+                user_query,
+                variant=variant,
+                initial_candidate=initial_candidate,
+                seed=seed,
+                repair_temperature=repair_temperature,
+                stream_final=stream_final,
+                write_chunk=write_chunk,
+            )
+        result["phase_metrics"] = list(metrics)
+        result["llm_calls"] = len(metrics)
+        result["prompt_tokens"] = sum(m.get("prompt_tokens", 0) for m in metrics)
+        result["completion_tokens"] = sum(m.get("completion_tokens", 0) for m in metrics)
+        return result
+    finally:
+        _request_phase_metrics.reset(metrics_token)
+        _request_seed.reset(seed_token)
+        _request_temperature_override.reset(temp_token)
+
+
 def _gc_cleanup():
     """Force garbage collection after each pipeline run to prevent memory accumulation.
     Python's allocator doesn't always return memory to OS — gc.collect() helps."""
@@ -1661,6 +2125,19 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
     )
 
     stream = body.get("stream", False)
+    requested_variant = body.get("isra_variant", "legacy_isra")
+    if requested_variant not in CODE_PIPELINE_VARIANTS:
+        return web.json_response(
+            {
+                "error": {
+                    "message": (
+                        f"Unknown isra_variant {requested_variant!r}; expected one of "
+                        f"{sorted(CODE_PIPELINE_VARIANTS)}"
+                    )
+                }
+            },
+            status=400,
+        )
     request_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -1750,6 +2227,11 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                 conversation_context=conversation_context,
                 session_state=session_state,
                 stream_final=True, write_chunk=write_chunk,
+                benchmark_temperature_override=body.get("isra_temperature_override"),
+                seed=body.get("seed"),
+                variant=requested_variant,
+                initial_candidate=body.get("isra_initial_candidate"),
+                repair_temperature=body.get("isra_repair_temperature"),
             )
 
             # Send final chunk with finish_reason
@@ -1792,6 +2274,11 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                 conversation_context=conversation_context,
                 session_state=session_state,
                 stream_final=False,
+                benchmark_temperature_override=body.get("isra_temperature_override"),
+                seed=body.get("seed"),
+                variant=requested_variant,
+                initial_candidate=body.get("isra_initial_candidate"),
+                repair_temperature=body.get("isra_repair_temperature"),
             )
 
             response = {
@@ -1806,13 +2293,23 @@ async def handle_chat_completions(request: web.Request) -> web.StreamResponse:
                         "finish_reason": "stop",
                     }
                 ],
-                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+                "usage": {
+                    "prompt_tokens": result.get("prompt_tokens", 0),
+                    "completion_tokens": result.get("completion_tokens", 0),
+                    "total_tokens": result.get("prompt_tokens", 0) + result.get("completion_tokens", 0),
+                },
                 "isra_metadata": {
                     "session_id": session_id,
                     "iterations": result["iterations"],
                     "elapsed_seconds": result["elapsed_seconds"],
                     "termination_reason": result["termination_reason"],
                     "history_msgs": len(history_msgs),
+                    "llm_calls": result.get("llm_calls", 0),
+                    "phase_metrics": result.get("phase_metrics", []),
+                    "benchmark_temperature_override": body.get("isra_temperature_override"),
+                    "seed": body.get("seed"),
+                    "variant": result.get("variant", requested_variant),
+                    "candidate_trace": result.get("candidate_trace"),
                 },
             }
             return web.json_response(response)
@@ -1855,6 +2352,11 @@ async def handle_health(request: web.Request) -> web.Response:
             "confidence_threshold": CONFIDENCE_THRESHOLD,
             "stagnation_threshold": STAGNATION_THRESHOLD,
             "session_ttl_seconds": SESSION_TTL,
+            "benchmark_temperature_override": True,
+            "phase_metrics": True,
+            "code_pipeline_variants": sorted(CODE_PIPELINE_VARIANTS),
+            "frozen_initial_candidate": True,
+            "trusted_evidence_rollback": True,
         },
     })
 

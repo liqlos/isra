@@ -5,5 +5,8 @@ __pycache__/
 logs/
 *.log
 .venv/
+.venv311/
 venv/
 .DS_Store
+benchmark_runs/
+.firecrawl/

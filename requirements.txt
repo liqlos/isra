@@ -1,1 +1,4 @@
 aiohttp>=3.9.0
+evalplus==0.3.1
+pytest>=8.0
+pytest-asyncio>=0.23

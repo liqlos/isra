@@ -1,5 +1,14 @@
 # ISRA Benchmark Results
 
+> [!WARNING]
+> **Historical exploratory results, not evidence of an ISRA quality gain.**
+> These runs were not consistently paired, mixed sampling and pipeline
+> settings, and sometimes counted infrastructure failures as wrong answers.
+> A later pinned 20-task HumanEval+ smoke on Llama 3.1 8B found zero paired
+> fixes from grounded repair or unguided retry at positive latency/token cost.
+> See [`THEORY_REVIEW.md`](THEORY_REVIEW.md) and
+> [`EXPERIMENT_LOG.md`](EXPERIMENT_LOG.md).
+
 ## Methodology
 
 ### Test Datasets
@@ -54,9 +63,9 @@ Strict execution-based checker:
 
 | Scenario | ISRA Impact |
 |----------|-------------|
-| Weak model + code | +5-10pp (catches errors via doctest feedback) |
+| Weak model + code | No demonstrated gain; 8B smoke produced zero fixes |
 | Strong model + code | -2 to -4pp (false negatives from self-tests, iteration noise) |
-| Weak model + math | +5-15pp (independent re-derivation catches arithmetic errors) |
+| Weak model + math | Untested under a trustworthy paired protocol |
 | Strong model + math | 0 to -5pp (model already correct, iterations add noise) |
 | Strong model + MC | Bypassed (fast-path) — no overhead, same as Direct |
 
@@ -69,7 +78,7 @@ Testing ISRA on weaker models was attempted but encountered MLX server compatibi
 - Qwen3.6-27B-abliterated-5bit-MLX: HTTP 404 errors on all requests (model not found by MLX)
 
 **Llama family models:**
-- Llama-3.1-8B-Instruct-3bit: Downloaded successfully (3.3GB), MLX server loads but doesn't respond to HTTP requests (connection refused)
+- Llama-3.1-8B-Instruct-3bit: later served successfully through raw MLX; the controlled 20-task mechanism smoke produced no quality gain
 - Llama-3-8B-Instruct-8bit: Download failed due to HuggingFace connection issues
 
 The benchmarking infrastructure is currently optimized for Qwen3.6-35B-A3B-abliterated-mixed36 only. Testing the hypothesis that "ISRA helps weak models more than strong models" requires either:
@@ -126,7 +135,11 @@ Current results are based on a single strong model (35B MoE), where ISRA shows m
 | Qwen3.5-35B-A3B (Direct) | 90.9% | ~95% (est) | Local, free |
 | ISRA v2 + Qwen3.5-35B-A3B | 89.0% | 89.0% (v1) | Local, free, +30s latency |
 
-**Honest assessment**: For a strong MoE model like Qwen3.5-35B-A3B, ISRA's critic-and-iterate pipeline does not improve accuracy on standard benchmarks. The model is already good enough that the orchestrator's overhead (false positives from self-tests, iteration noise, timeout failures) outweighs the benefits. ISRA is more valuable for weaker models or specialized reasoning tasks where the base model makes errors that a critic can catch.
+**Current assessment**: Neither the historical strong-model runs nor the later
+controlled 8B smoke demonstrate an accuracy gain from ISRA. The weaker-model
+hypothesis remains possible in principle, especially with genuinely external
+verification or trained correction, but is not supported by this repository's
+current evidence.
 
 ## Running Benchmarks
 
