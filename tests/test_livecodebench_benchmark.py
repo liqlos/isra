@@ -11,6 +11,7 @@ from benchmarks.livecodebench_benchmark import (
     make_body,
     variant_order,
 )
+from benchmarks.livecodebench_data import iter_filtered_records
 from benchmarks.paired_core import sha256_json
 
 
@@ -69,3 +70,35 @@ def test_livecodebench_direct_and_spa_share_exact_public_messages(tmp_path):
     assert variant_order(str(tasks[0]["task_id"]), 0) == variant_order(
         str(tasks[0]["task_id"]), 0
     )
+
+
+def test_livecodebench_streaming_filter_uses_all_release_v6_source_files(tmp_path):
+    for name, date in {
+        "test.jsonl": "2023-12-31T00:00:00",
+        "test2.jsonl": "2024-01-01T00:00:00",
+        "test3.jsonl": "2024-02-01T00:00:00",
+        "test4.jsonl": "2024-03-01T00:00:00",
+        "test5.jsonl": "2024-04-01T00:00:00",
+        "test6.jsonl": "2025-04-30T00:00:00",
+    }.items():
+        (tmp_path / name).write_text(
+            json.dumps({"question_id": name, "contest_date": date}) + "\n",
+            encoding="utf-8",
+        )
+
+    rows = list(
+        iter_filtered_records(
+            release_version="release_v6",
+            start_date="2024-01-01",
+            end_date="2025-04-30",
+            snapshot_dir=tmp_path,
+        )
+    )
+
+    assert [row["question_id"] for row in rows] == [
+        "test2.jsonl",
+        "test3.jsonl",
+        "test4.jsonl",
+        "test5.jsonl",
+        "test6.jsonl",
+    ]

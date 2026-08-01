@@ -13,15 +13,23 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 import subprocess
+import sys
+from types import SimpleNamespace
 from pathlib import Path
 from typing import Any
 
-from lcb_runner.benchmarks.code_generation import load_code_generation_dataset
-from lcb_runner.prompts.code_generation import (
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from lcb_runner.prompts.code_generation import (  # noqa: E402
     PromptConstants,
     get_generic_question_template_answer,
 )
+
+from benchmarks.livecodebench_data import DATASET_REPOSITORY, iter_filtered_records  # noqa: E402
 
 
 def canonical_json(value: Any) -> str:
@@ -34,21 +42,38 @@ def sha256_json(value: Any) -> str:
 
 def git_revision() -> str:
     completed = subprocess.run(
-        ("git", "rev-parse", "HEAD"), text=True, capture_output=True, check=True
+        (
+            "git",
+            "-c",
+            "safe.directory=/opt/livecodebench",
+            "-C",
+            os.environ.get("LIVE_CODE_BENCH_DIR", "/opt/livecodebench"),
+            "rev-parse",
+            "HEAD",
+        ),
+        text=True,
+        capture_output=True,
+        check=True,
     )
     return completed.stdout.strip()
 
 
-def decoder_task(problem: Any) -> dict[str, Any]:
+def decoder_task(row: dict[str, Any]) -> dict[str, Any]:
+    # The official generic prompt accesses only these two public fields.  Using
+    # an adapter avoids decoding either public or private test objects.
+    prompt_problem = SimpleNamespace(
+        question_content=str(row["question_content"]),
+        starter_code=str(row["starter_code"]),
+    )
     messages = [
         {"role": "system", "content": PromptConstants.SYSTEM_MESSAGE_GENERIC},
-        {"role": "user", "content": get_generic_question_template_answer(problem)},
+        {"role": "user", "content": get_generic_question_template_answer(prompt_problem)},
     ]
     return {
-        "task_id": str(problem.question_id),
-        "contest_date": problem.contest_date.date().isoformat(),
-        "platform": problem.platform.value,
-        "difficulty": problem.difficulty.value,
+        "task_id": str(row["question_id"]),
+        "contest_date": str(row["contest_date"])[:10],
+        "platform": str(row["platform"]),
+        "difficulty": str(row["difficulty"]),
         "prompt_messages": messages,
         "prompt_sha256": sha256_json(messages),
     }
@@ -64,10 +89,17 @@ def main() -> int:
 
     if args.output.exists():
         raise FileExistsError(f"refusing to overwrite manifest: {args.output}")
-    problems = load_code_generation_dataset(
-        args.release_version, start_date=args.start_date, end_date=args.end_date
+    tasks = sorted(
+        (
+            decoder_task(row)
+            for row in iter_filtered_records(
+                release_version=args.release_version,
+                start_date=args.start_date,
+                end_date=args.end_date,
+            )
+        ),
+        key=lambda task: task["task_id"],
     )
-    tasks = sorted((decoder_task(problem) for problem in problems), key=lambda task: task["task_id"])
     if not tasks:
         raise RuntimeError("official LiveCodeBench filter returned no tasks")
     if len({task["task_id"] for task in tasks}) != len(tasks):
@@ -83,7 +115,7 @@ def main() -> int:
         "official_source": {
             "repository": "https://github.com/LiveCodeBench/LiveCodeBench",
             "revision": git_revision(),
-            "dataset": "livecodebench/code_generation_lite",
+            "dataset": DATASET_REPOSITORY,
             "release_version": args.release_version,
             "datasets_version": importlib.metadata.version("datasets"),
         },

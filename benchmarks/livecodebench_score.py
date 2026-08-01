@@ -19,6 +19,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from benchmarks.harness_common import file_sha256, utc_now  # noqa: E402
+from benchmarks.livecodebench_data import iter_filtered_records  # noqa: E402
 from benchmarks.paired_core import read_jsonl, sha256_text, write_json_exclusive  # noqa: E402
 
 
@@ -47,6 +48,17 @@ def index_results(records: list[dict[str, Any]], task_ids: list[str]) -> dict[st
     return grouped
 
 
+def batches(values: Any, size: int) -> Any:
+    batch = []
+    for value in values:
+        batch.append(value)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--task-manifest", type=Path, required=True)
@@ -56,47 +68,113 @@ def main() -> int:
     parser.add_argument("--timeout", type=int, default=6)
     parser.add_argument("--workers", type=int, default=1)
     parser.add_argument("--task-limit", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=8)
     args = parser.parse_args()
     if args.output.exists() or args.evaluation_metadata.exists():
         raise FileExistsError("refusing to overwrite an existing scored artifact")
 
     # Imports occur only in this evaluator process, never in the decoder runner.
     os.chdir("/opt/livecodebench")
-    from lcb_runner.benchmarks.code_generation import load_code_generation_dataset
+    from lcb_runner.benchmarks.code_generation import CodeGenerationProblem
     from lcb_runner.evaluation import codegen_metrics, extract_instance_results
     from lcb_runner.lm_styles import LMStyle
     from lcb_runner.utils.extraction_utils import extract_code
 
     task_manifest = load_manifest(args.task_manifest)
-    if args.task_limit < 0:
-        raise ValueError("task-limit cannot be negative")
+    if args.task_limit < 0 or args.batch_size <= 0:
+        raise ValueError("task-limit cannot be negative and batch-size must be positive")
     selected_tasks = task_manifest["tasks"][: args.task_limit or None]
     task_ids = [str(task["task_id"]) for task in selected_tasks]
     records = read_jsonl(args.results)
     by_variant = index_results(records, task_ids)
     source = task_manifest["official_source"]
     selection = task_manifest["selection"]
-    benchmark = sorted(load_code_generation_dataset(source["release_version"], start_date=selection["start_date"], end_date=selection["end_date"]), key=lambda problem: problem.question_id)
-    benchmark = [problem for problem in benchmark if str(problem.question_id) in set(task_ids)]
-    if [str(problem.question_id) for problem in benchmark] != task_ids:
-        raise RuntimeError("official evaluator task set differs from frozen decoder manifest")
-    samples = [problem.get_evaluation_sample() for problem in benchmark]
+    requested = set(task_ids)
+    rows_by_id = {
+        variant: {str(row["task_id"]): row for row in rows}
+        for variant, rows in by_variant.items()
+    }
+    outcomes: dict[tuple[str, str], tuple[bool, str]] = {}
+    seen: set[str] = set()
+    passed_counts = {variant: 0 for variant in by_variant}
+    evaluated_counts = {variant: 0 for variant in by_variant}
+    official_rows = (
+        row
+        for row in iter_filtered_records(
+            release_version=source["release_version"],
+            start_date=selection["start_date"],
+            end_date=selection["end_date"],
+        )
+        if str(row["question_id"]) in requested
+    )
+    for raw_batch in batches(official_rows, args.batch_size):
+        ids = [str(row["question_id"]) for row in raw_batch]
+        if len(set(ids)) != len(ids) or any(task_id in seen for task_id in ids):
+            raise RuntimeError("official evaluator source has duplicate selected task IDs")
+        seen.update(ids)
+        problems = [CodeGenerationProblem(**row) for row in raw_batch]
+        samples = [problem.get_evaluation_sample() for problem in problems]
+        for variant in by_variant:
+            active = [index for index, task_id in enumerate(ids) if rows_by_id[variant][task_id].get("status") == "completed"]
+            if not active:
+                continue
+            active_samples = [samples[index] for index in active]
+            generated = [
+                [extract_code(str(rows_by_id[variant][ids[index]].get("response", "")), LMStyle.LLaMa3)]
+                for index in active
+            ]
+            _, raw_grades, _ = codegen_metrics(
+                active_samples,
+                generated,
+                k_list=[1],
+                num_process_evaluate=args.workers,
+                timeout=args.timeout,
+                debug=False,
+            )
+            grades = extract_instance_results(raw_grades)
+            if len(grades) != len(active):
+                raise RuntimeError("official evaluator returned an unexpected grade count")
+            for index, generated_code, grade in zip(active, generated, grades):
+                task_id = ids[index]
+                passed = bool(grade[0])
+                outcomes[(variant, task_id)] = (passed, generated_code[0])
+                passed_counts[variant] += int(passed)
+                evaluated_counts[variant] += 1
+        del samples, problems
+    if seen != requested:
+        missing = sorted(requested - seen)
+        unexpected = sorted(seen - requested)
+        raise RuntimeError(f"official evaluator task set differs from frozen decoder manifest: missing={missing[:3]}, unexpected={unexpected[:3]}")
+    for variant, rows in by_variant.items():
+        expected_completed = {str(row["task_id"]) for row in rows if row.get("status") == "completed"}
+        actual = {task_id for current_variant, task_id in outcomes if current_variant == variant}
+        if actual != expected_completed:
+            raise RuntimeError(f"official evaluator did not grade every completed {variant} result")
 
     scored: list[dict[str, Any]] = []
-    score_metadata: dict[str, Any] = {"scored_at": utc_now(), "evaluator": "LiveCodeBench official codegen_metrics", "official_source": source, "selection": selection, "timeout_seconds": args.timeout, "workers": args.workers, "variants": {}}
+    score_metadata: dict[str, Any] = {
+        "scored_at": utc_now(),
+        "evaluator": "LiveCodeBench official codegen_metrics",
+        "official_source": source,
+        "selection": selection,
+        "timeout_seconds": args.timeout,
+        "workers": args.workers,
+        "batch_size": args.batch_size,
+        "variants": {},
+    }
     for variant, rows in by_variant.items():
-        generations = [[extract_code(str(row.get("response", "")), LMStyle.LLaMa3) if row.get("status") == "completed" else ""] for row in rows]
-        metrics, raw_grades, metadata = codegen_metrics(samples, generations, k_list=[1], num_process_evaluate=args.workers, timeout=args.timeout, debug=False)
-        grades = extract_instance_results(raw_grades)
-        if len(grades) != len(rows):
-            raise RuntimeError("official evaluator returned an unexpected grade count")
-        score_metadata["variants"][variant] = {"pass_at_1": metrics.get("pass@1"), "grader_metadata": metadata}
-        for row, generated, grade in zip(rows, generations, grades):
+        score_metadata["variants"][variant] = {
+            "completed_records_evaluated": evaluated_counts[variant],
+            "completed_pass_at_1": passed_counts[variant] / evaluated_counts[variant] if evaluated_counts[variant] else None,
+            "pass_at_1_with_noncompleted_as_failures": passed_counts[variant] / len(task_ids),
+        }
+        for row in rows:
             copy = dict(row)
-            if copy.get("status") == "completed":
-                copy["passed"] = bool(grade[0])
+            outcome = outcomes.get((variant, str(copy["task_id"])))
+            if outcome is not None:
+                copy["passed"], generated_code = outcome
                 copy["evaluator_message"] = "official LiveCodeBench codegen_metrics"
-                copy["extracted_code_sha256"] = sha256_text(generated[0])
+                copy["extracted_code_sha256"] = sha256_text(generated_code)
             scored.append(copy)
     scored.sort(key=lambda row: (str(row["task_id"]), str(row["variant"])))
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -106,7 +184,7 @@ def main() -> int:
     score_metadata["input_results_sha256"] = file_sha256(args.results)
     score_metadata["scored_results_sha256"] = file_sha256(args.output)
     write_json_exclusive(args.evaluation_metadata, score_metadata)
-    print(json.dumps({variant: details["pass_at_1"] for variant, details in score_metadata["variants"].items()}, sort_keys=True))
+    print(json.dumps(score_metadata["variants"], sort_keys=True))
     return 0
 
 
