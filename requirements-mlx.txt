@@ -1,0 +1,5 @@
+# Install in an Apple Silicon environment used to host anchored_generation.py.
+# The evaluated remote environment used these MLX family versions.
+mlx==0.32.0
+mlx-lm==0.31.3
+aiohttp>=3.9.0

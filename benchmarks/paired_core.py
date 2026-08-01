@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared, testable primitives for the paired ISRA benchmark harness."""
+"""Shared, testable primitives for paired one-pass code benchmarks."""
 
 from __future__ import annotations
 
@@ -27,7 +27,6 @@ RESULT_STATUSES = {
     "timeout",
     "transport_error",
     "evaluator_error",
-    "skipped_parent_unavailable",
 }
 INFRASTRUCTURE_STATUSES = {"timeout", "transport_error"}
 
@@ -36,23 +35,6 @@ TASK_SYSTEM_MESSAGE = (
     "the complete function and any required imports."
 )
 TASK_USER_PREFIX = "Complete this function:\n\n"
-
-
-@dataclass(frozen=True)
-class VariantSpec:
-    name: str
-    endpoint_kind: str
-    temperature: float
-    top_p: float
-    isra_temperature_override: float | None
-
-
-VARIANT_SPECS: dict[str, VariantSpec] = {
-    "direct_greedy": VariantSpec("direct_greedy", "direct", 0.0, 0.95, None),
-    "isra_greedy": VariantSpec("isra_greedy", "isra", 0.0, 0.95, 0.0),
-    "direct_sampled": VariantSpec("direct_sampled", "direct", 0.6, 0.95, None),
-    "isra_sampled": VariantSpec("isra_sampled", "isra", 0.6, 0.95, None),
-}
 
 
 def canonical_json(value: Any) -> str:
@@ -83,15 +65,6 @@ def primary_key(record: dict[str, Any]) -> tuple[str, str, str, str, int]:
         str(record["variant"]),
         int(record["seed"]),
     )
-
-
-def randomized_variant_order(task_id: str, seed: int) -> list[str]:
-    """Stable shuffle independent of Python's randomized hash seed."""
-    digest = hashlib.sha256(f"{seed}\0{task_id}".encode()).digest()
-    rng = random.Random(int.from_bytes(digest[:8], "big"))
-    variants = list(VARIANT_SPECS)
-    rng.shuffle(variants)
-    return variants
 
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
@@ -495,7 +468,9 @@ def paired_bootstrap_delta(
     deltas = []
     for _ in range(samples):
         draw = [pairs[rng.randrange(len(pairs))] for _ in pairs]
-        deltas.append(sum(int(isra) - int(direct) for direct, isra in draw) / len(draw))
+        deltas.append(
+            sum(int(treatment) - int(direct) for direct, treatment in draw) / len(draw)
+        )
     low = percentile(deltas, 0.025)
     high = percentile(deltas, 0.975)
     assert low is not None and high is not None

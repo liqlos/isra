@@ -1,161 +1,89 @@
-# ISRA Benchmark Results
+# Benchmark evidence and policy
 
-> [!WARNING]
-> **Historical exploratory results, not evidence of an ISRA quality gain.**
-> These runs were not consistently paired, mixed sampling and pipeline
-> settings, and sometimes counted infrastructure failures as wrong answers.
-> A later pinned 20-task HumanEval+ smoke on Llama 3.1 8B found zero paired
-> fixes from grounded repair or unguided retry at positive latency/token cost.
-> See [`THEORY_REVIEW.md`](THEORY_REVIEW.md) and
-> [`EXPERIMENT_LOG.md`](EXPERIMENT_LOG.md).
+## Status
 
-## Methodology
+This repository contains two materially different results:
 
-### Test Datasets
-- **HumanEval**: Full 164 tasks from OpenAI's HumanEval benchmark. Each task has a function signature + docstring + actual test cases (assert statements). Correctness verified by executing generated code against test cases in subprocess.
-- **GSM8K**: 300 tasks (random sample, seed=42) from GSM8K grade-school math problems (full dataset: 1319). Correctness verified by comparing extracted numeric answer (`#### N` format) to ground truth.
-- **MMLU-Pro**: 500 tasks (random sample) — multiple-choice knowledge questions. ISRA not optimized for MC tasks (stopped early).
+| Mechanism | Controlled result | Decision |
+|---|---|---|
+| Legacy iterative self-refinement | 0 paired fixes in the controlled Llama 3.1 8B 20-task smoke; grounded repair cost +27.8% wall time and retry +35.8% | Retired. |
+| SPAall logits intervention | 12/20 pass versus 10/20 direct on a separate preregistered 20-task development screen; 2 fixes, 0 regressions, 1.226× mean wall time | Proceed once to a disjoint confirmatory evaluation; no further tuning on this screen. |
 
-### Endpoints Tested
-- **Direct**: Vanilla model call (no orchestrator) via model router at `:8080`. Thinking mode disabled for HumanEval (matches ISRA CODE behavior).
-- **ISRA**: Full ISRA pipeline at `:8083`
+The SPA result is not a claim that the method improves code generation in
+general. The exact McNemar p-value is 0.5 and the task-paired 95% bootstrap
+interval for the +10 percentage-point difference is [0, +25] percentage
+points. Twenty tasks are a development gate, not adequate evidence of efficacy.
 
-### Model
-Qwen3.5-35B-A3B (MoE, 3B active parameters), 3-bit MLX quantization, running on Mac mini M4 (24GB RAM).
+Historical HumanEval/GSM8K/MMLU numbers from the removed ISRA runtime were
+exploratory, not consistently paired and sometimes mixed sampling settings.
+They must not be used as baseline or marketing evidence. Their audit context is
+preserved in [EXPERIMENT_LOG.md](EXPERIMENT_LOG.md) and Git history.
 
-### Checker
-Strict execution-based checker:
-- Code: `exec(generated_code + test_asserts)` in subprocess — must pass without exception
-- Math: Extract number from `#### N` format, compare to ground truth as float
+## SPAall development screen, 2026-08-01
 
-## Results (v2 — with max_tokens=4096, top_k=20, presence_penalty, \boxed{} support, MC fast-path)
+### Frozen design
 
-| Benchmark | Tasks | ISRA (v2) | ISRA (v1) | Direct (vanilla) | Official Qwen3.5-35B-A3B |
-|-----------|-------|-----------|-----------|-----------------|--------------------------|
-| **HumanEval** | 164 | **146/164 = 89.0%** | 143/164 = 87.2% | 149/164 = 90.9% | ~74.6% (LiveCodeBench v6)* |
-| GSM8K | 300 | not completed (timeout/502) | 267/300 = 89.0% | ~75% (partial) | не опубликован |
-| MMLU-Pro | 500 | not completed | — | — | 85.3% |
+- Model: Meta-Llama-3.1-8B-Instruct-3bit, same checkpoint in both modes.
+- Generation: greedy, one answer, maximum 800 completion tokens.
+- Treatment: natural-language masking, Llama 3 finetune-right-pad token,
+  omega = 1.28, enabled on every treatment task.
+- Dataset: HumanEvalPlus v0.1.10, tasks 20--31 and 33--40.
+- Oracle: EvalPlus 0.3.1 in the pinned local
+  isra-evalplus:0.3.1 image.
+- Isolation: evaluator tests did not enter the decoder; the benchmark
+  repository mount was read-only.
+- Provenance: task messages matched byte-for-byte per pair; each record reports
+  exactly one LLM call. Mode order was deterministically randomized per task.
 
-*LiveCodeBench v6 is a different (harder) code benchmark than HumanEval.
+HumanEval/32 was excluded before model calls. EvalPlus 0.3.1's find_zero
+special oracle executes continue before recording a successful input, so it
+reports the canonical solution as fail (0/0). HumanEval/40 was the fixed
+replacement.
 
-### Key Findings (v2)
+### Result
 
-1. **ISRA improved from 87.2% to 89.0% on HumanEval** (+1.8pp) after fixes:
-   - max_tokens raised 2000→4096 (8K caused 600s timeouts on GSM8K)
-   - top_k=20 added per Qwen thinking-mode spec
-   - presence_penalty added (0.0 for code, 1.5 for general)
-   - Phase 4 temp raised 0.2→0.6 (Qwen recommends 0.6+ for thinking mode)
-   - \boxed{} support added to extraction (Qwen3.5 trained on \boxed{} format)
-   - MC fast-path added (bypass 11-call pipeline for multiple-choice)
+| Metric | Direct | SPAall |
+|---|---:|---:|
+| Passed tasks | 10/20 | 12/20 |
+| Direct-wrong to SPA-right | — | 2 |
+| Direct-right to SPA-wrong | — | 0 |
+| Mean wall time | 5,194.507 ms | 6,369.102 ms |
+| Mean wall-time ratio | — | 1.226× |
+| p95 wall time | 14,343.208 ms | 12,906.789 ms |
+| Mean completion tokens | 270.90 | 212.35 |
+| Mean reported decode throughput | 57.74 tok/s | 38.75 tok/s |
+| Mean reported MLX peak allocation | 3.602 GB | 3.748 GB |
 
-2. **ISRA still below Direct (90.9%)** on HumanEval. The 1.9pp gap is due to:
-   - Iteration noise: self-generated tests produce false negatives, causing model to "fix" working code
-   - Temperature confound: ISRA uses temp=0.6 for Phase 1 (matches Qwen spec), Direct uses temp=0 (greedy)
-   - Overhead: ISRA's multi-phase pipeline adds latency without accuracy gain for strong models
+The p95 service-latency ratio is 0.900 because the modes completed different
+numbers of tokens. The median per-task ratio is 1.534, while two short direct
+answers make the p95 per-task ratio 2.896. Therefore the screen meets the
+preregistered aggregate wall-time gate but does not establish a uniform
+per-request latency bound.
 
-3. **GSM8K not completed with max_tokens=4096** — still encountering timeouts/502 errors. The 89.0% v1 result stands.
+No record had a model, formatting, transport or evaluator error. macOS pageouts
+were unchanged during the run. The host already had substantial swap use and
+other model services running; its small concurrent swap-counter change cannot be
+attributed to SPA, so this shared-host run is not a clean memory-pressure
+measurement.
 
-4. **MMLU-Pro not completed** — MC fast-path added but benchmark not run due to MLX server instability.
+The immutable run artifacts are intentionally Git-ignored:
 
-5. **Official Qwen3.5-35B-A3B does not publish GSM8K/HumanEval/MATH** — uses HMMT, LiveCodeBench v6, SWE-bench instead.
+~~~text
+benchmark_runs/real-llama31-8b3bit-spa-dev-20-v2/
+  manifest.json
+  results.jsonl
+  analysis-direct_greedy-vs-spa_greedy.json
+  disagreements-direct_greedy-vs-spa_greedy.jsonl
+~~~
 
-### When ISRA Helps vs Hurts (updated)
+## Required next evaluation
 
-| Scenario | ISRA Impact |
-|----------|-------------|
-| Weak model + code | No demonstrated gain; 8B smoke produced zero fixes |
-| Strong model + code | -2 to -4pp (false negatives from self-tests, iteration noise) |
-| Weak model + math | Untested under a trustworthy paired protocol |
-| Strong model + math | 0 to -5pp (model already correct, iterations add noise) |
-| Strong model + MC | Bypassed (fast-path) — no overhead, same as Direct |
+Freeze the implementation, model revision, prompt, mask and strength. Evaluate
+at least 100 disjoint objective code-generation tasks, preferably a
+date-filtered post-cutoff LiveCodeBench slice. Report pass@1, exact McNemar,
+task-paired bootstrap confidence interval, error categories, output length,
+mean and p95 wall time. Continue only if the difference is at least +2
+percentage points and the confidence-interval lower bound is above zero.
 
-### Infrastructure Limitations
-
-Testing ISRA on weaker models was attempted but encountered MLX server compatibility issues:
-
-**Qwen family models:**
-- Qwen3.5-0.8B-draft: MLX server failed to respond (possible format incompatibility)
-- Qwen3.6-27B-abliterated-5bit-MLX: HTTP 404 errors on all requests (model not found by MLX)
-
-**Llama family models:**
-- Llama-3.1-8B-Instruct-3bit: later served successfully through raw MLX; the controlled 20-task mechanism smoke produced no quality gain
-- Llama-3-8B-Instruct-8bit: Download failed due to HuggingFace connection issues
-
-The benchmarking infrastructure is currently optimized for Qwen3.6-35B-A3B-abliterated-mixed36 only. Testing the hypothesis that "ISRA helps weak models more than strong models" requires either:
-1. MLX-compatible conversions of smaller models with correct tokenizers/configs
-2. Alternative backend (llama.cpp for GGUF models)
-3. Cloud-based testing on weaker models
-
-Current results are based on a single strong model (35B MoE), where ISRA shows minimal or negative impact.
-
-## Optimization History (v2 updates)
-
-### Implemented (v2)
-
-| Optimization | Impact |
-|-------------|--------|
-| max_tokens 2000→4096 | Prevents code truncation, but 8K caused timeouts |
-| top_k=20 added | Matches Qwen thinking-mode spec |
-| presence_penalty added | Prevents repetition loops |
-| Phase 4 temp 0.2→0.6 | Matches Qwen spec (recommends 0.6+ for thinking mode) |
-| \boxed{} extraction | Qwen3.5 trained on \boxed{} format |
-| MC fast-path | Bypasses 11-call pipeline for multiple-choice (prevents 320s timeouts) |
-| extract_mmlu_answer() fix | Check "answer is X" first (was checking first letter in prose) |
-
-### Implemented (v1 - kept)
-
-| Optimization | Impact |
-|-------------|--------|
-| Phase 0 quick consensus | ~1s for trivial queries (was 30-80s) |
-| DEER early exit (MATH) | 75% of math tasks skip phases 2-4, avg 29s (was 48s) |
-| Doctest execution feedback | Catches code logic errors via subprocess execution |
-| Self-generated test cases | For tasks without doctests |
-| FIX MODE for code rethink | Model fixes bugs instead of rewriting |
-| Doctest errors → Phase 2 critic | Better critic feedback |
-| repr() comparison fix | Fixes false doctest failures on string returns |
-| Phase 0 parallel (asyncio.gather) | 0.3-0.5s savings |
-
-### Tested and Reverted
-
-| Optimization | Result | Reason |
-|-------------|--------|--------|
-| DEER + Phase 2 parallel | 2x latency regression | Memory pressure from 2 concurrent KV caches |
-| SC majority vote for MATH | GSM8K regression | Wrong answer picked on edge cases |
-| SC mixed temperatures [0.0, 0.7] | GSM8K regression | Greedy sample consistently wrong on some tasks |
-| SC N=3 sampling | Same accuracy as N=2 | +40% latency, not worth it |
-| max_tokens 4096→8192 | HumanEval 89.0% → 89.0% (no gain), GSM8K timeouts | 8K caused 600s timeouts on complex tasks |
-
-## Comparison with Published Models
-
-| Model | HumanEval | GSM8K | Notes |
-|-------|-----------|-------|-------|
-| Claude 3.5 Sonnet | 93.7% | 96.4% | Cloud, $3/M tokens |
-| GPT-4o | 90.2% | 90.5% | Cloud, $5/M tokens |
-| Gemini 1.5 Pro | 79.3% | 88.9% | Cloud |
-| Qwen3.5-35B-A3B (Direct) | 90.9% | ~95% (est) | Local, free |
-| ISRA v2 + Qwen3.5-35B-A3B | 89.0% | 89.0% (v1) | Local, free, +30s latency |
-
-**Current assessment**: Neither the historical strong-model runs nor the later
-controlled 8B smoke demonstrate an accuracy gain from ISRA. The weaker-model
-hypothesis remains possible in principle, especially with genuinely external
-verification or trained correction, but is not supported by this repository's
-current evidence.
-
-## Running Benchmarks
-
-```bash
-# Set API key (if your backend requires one)
-export MLX_LOCAL_API_KEY=your-key
-
-# Full official benchmark (HumanEval 164 + GSM8K 300 + MMLU-Pro 500)
-python benchmarks/official_benchmark.py
-
-# Skip HumanEval (already completed)
-SKIP_HUMANEVAL=1 python benchmarks/official_benchmark.py
-
-# Quick HumanEval-only test (20 tasks)
-python benchmarks/bench_he_isra.py
-
-# Quick GSM8K-only test (20 tasks)
-python benchmarks/bench_gsm_isra.py
-```
+HumanEval+ and MBPP+ remain useful regression suites, not the headline
+benchmark.

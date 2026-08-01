@@ -313,3 +313,101 @@ The next defensible development work is one of:
 compileall: passed
 git diff --check: passed
 ```
+
+## 2026-08-01 — SPAall replacement prototype and development screen
+
+### Design decision
+
+The literature and independent research review rejected another same-model
+critique loop. The replacement mechanism is Selective Prompt Anchoring
+(SPAall): at every generated token, run the same model over the visible prompt
+and a position-preserving masked-prompt copy, then calculate:
+
+~~~text
+L_spa = omega * L + (1 - omega) * L_mask
+~~~
+
+The first implementation used the paper's cross-model omega = 1.28 preset, a
+natural-language anchor, and the Llama 3 finetune-right-pad token (id 128004).
+It exposes one OpenAI-compatible answer, has no critic/retry/selector and never
+receives evaluator tests. The design, sources and pre-registered gates are in
+[REPLACEMENT_DESIGN.md](REPLACEMENT_DESIGN.md).
+
+### Integrity gates
+
+- Unit tests cover prompt masking, token-position preservation, logits
+  arithmetic, response metadata, preflight and paired-run provenance.
+- A first five-task identity run is retained as invalid transport evidence:
+  MLX stream state was mistakenly handed to a worker thread, causing ten
+  transport errors. No quality conclusion was drawn.
+- After keeping MLX generation on the model-loading thread, direct and
+  SPA(omega=1) emitted identical completion token-ID hashes, finish reasons and
+  evaluator outcomes for HumanEval+ tasks 20--24. Aggregate wall time was
+  1.528× and MLX peak allocation increased from 3.674 GB to 3.877 GB.
+- The pinned EvalPlus 0.3.1 evaluator revealed a dataset-specific defect:
+  HumanEval/32's find_zero oracle runs continue before recording successful
+  details, therefore falsely rejects even the canonical solution as fail (0/0).
+  This was reproduced directly against the evaluator source. The task was
+  excluded before inference and HumanEval/40 substituted.
+- The exact 20-task replacement set passed 20/20 canonical-solution and
+  20/20 intentional-mutation sanity checks in the pinned container.
+
+### Real paired result
+
+Finalized run:
+
+~~~text
+benchmark_runs/real-llama31-8b3bit-spa-dev-20-v2/
+~~~
+
+Configuration:
+
+- Meta-Llama-3.1-8B-Instruct-3bit; same model and visible messages in both
+  modes; greedy decoding; maximum 800 tokens.
+- HumanEvalPlus v0.1.10 tasks 20--31 and 33--40; each pair used one stable
+  seed and deterministically randomized mode order.
+- EvalPlus 0.3.1 in the pinned local image
+  isra-evalplus:0.3.1@sha256:ad611279c9e1a0cbe9466dcde3f862f263683461465d260f4d4f6d5fdd684e4b.
+- The evaluator container saw a read-only repository plus a separate writable
+  result mount. Existing remote services were not changed.
+
+Observed outcome:
+
+| Outcome | Count |
+|---|---:|
+| Direct pass / SPA pass | 10 |
+| Direct fail / SPA fail | 8 |
+| Direct fail / SPA pass | 2 |
+| Direct pass / SPA fail | 0 |
+| Model, format, transport or evaluator errors | 0 |
+
+Direct passed 10/20 and SPA passed 12/20. The two treatment-only fixes were
+HumanEval/20 and HumanEval/31; both are preserved in the immutable
+disagreement record. Exact McNemar two-sided p = 0.5; the task-paired bootstrap
+95% interval for the +10 percentage-point difference is [0, +25] points.
+
+Wall time was 5,194.507 ms mean for Direct and 6,369.102 ms for SPAall, a
+1.226× aggregate ratio. p95 service wall time was 14,343.208 ms versus
+12,906.789 ms, but this is partly caused by treatment outputting fewer tokens:
+270.90 mean Direct completion tokens versus 212.35 SPA tokens. Median
+within-task latency ratio was 1.534; the p95 ratio was 2.896. MLX-reported
+mean peak allocation was 3.602 GB Direct versus 3.748 GB SPA, with maxima
+3.674 and 3.877 GB.
+
+The shared 24 GB Mac already had substantial swap use and other model services.
+Pageouts did not increase during this run, but swap counters changed slightly;
+this cannot be attributed cleanly to the test. The run is evidence about
+quality and service latency, not an isolated memory-pressure study.
+
+### Decision
+
+SPAall clears the pre-registered **development** quality and aggregate-latency
+gates exactly once: two fixes, zero regressions, mean ratio below 1.60×, p95
+service ratio below 1.75×, and no response errors. It does **not** clear a
+confirmatory efficacy standard. Parameters are now frozen. Do not tune on these
+20 tasks; the only acceptable next SPA experiment is the disjoint confirmatory
+gate described in REPLACEMENT_DESIGN.md.
+
+The original ISRA runtime, its router, deployment scripts, legacy runners and
+their tests are removed from the working tree. Git history preserves the
+negative result and prior exploratory code.

@@ -1,1 +1,1 @@
-"""Reproducible benchmark harnesses for ISRA."""
+"""Reproducible paired benchmark harnesses for local-model experiments."""

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Analyze paired benchmark JSONL without treating infrastructure failures as wrong answers."""
+"""Analyze paired benchmark JSONL without calling infrastructure failures wrong."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ def metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
     latency = [float(record["latency_ms"]) for record in completed]
     return {
         "completed_records": len(completed),
+        "mean_latency_ms": statistics.fmean(latency) if latency else None,
         "median_latency_ms": statistics.median(latency) if latency else None,
         "p95_latency_ms": percentile(latency, 0.95),
         "mean_prompt_tokens": (
@@ -51,16 +52,18 @@ def metric_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
 def analyze(
     records: list[dict[str, Any]],
     direct_variant: str,
-    isra_variant: str,
+    treatment_variant: str,
     bootstrap_samples: int,
     bootstrap_seed: int,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     selected = [
-        record for record in records if record.get("variant") in {direct_variant, isra_variant}
+        record
+        for record in records
+        if record.get("variant") in {direct_variant, treatment_variant}
     ]
     by_variant = {
         variant: [record for record in selected if record.get("variant") == variant]
-        for variant in (direct_variant, isra_variant)
+        for variant in (direct_variant, treatment_variant)
     }
     indexes: dict[str, dict[tuple[str, int, str], dict[str, Any]]] = {}
     for variant, variant_records in by_variant.items():
@@ -72,59 +75,62 @@ def analyze(
             index[key] = record
         indexes[variant] = index
 
-    all_keys = sorted(set(indexes[direct_variant]) | set(indexes[isra_variant]))
+    all_keys = sorted(set(indexes[direct_variant]) | set(indexes[treatment_variant]))
     completed_pairs: list[tuple[bool, bool]] = []
-    pair_rows = []
     excluded = []
     disagreements = []
     for key in all_keys:
         direct = indexes[direct_variant].get(key)
-        isra = indexes[isra_variant].get(key)
-        if not direct or not isra:
+        treatment = indexes[treatment_variant].get(key)
+        if not direct or not treatment:
             excluded.append({"key": key, "reason": "missing_pair_member"})
             continue
-        if direct.get("status") != "completed" or isra.get("status") != "completed":
+        if direct.get("status") != "completed" or treatment.get("status") != "completed":
             excluded.append(
                 {
                     "key": key,
                     "reason": "non_completed_status",
                     "direct_status": direct.get("status"),
-                    "isra_status": isra.get("status"),
+                    "treatment_status": treatment.get("status"),
                 }
             )
             continue
         direct_pass = bool(direct.get("passed"))
-        isra_pass = bool(isra.get("passed"))
-        completed_pairs.append((direct_pass, isra_pass))
+        treatment_pass = bool(treatment.get("passed"))
+        completed_pairs.append((direct_pass, treatment_pass))
         row = {
             "task_id": key[0],
             "seed": key[1],
             "model": key[2],
             "direct_passed": direct_pass,
-            "isra_passed": isra_pass,
+            "treatment_passed": treatment_pass,
         }
-        pair_rows.append(row)
-        if direct_pass != isra_pass:
+        if direct_pass != treatment_pass:
             disagreements.append(
                 {
                     **row,
-                    "provisional_outcome": "fix" if isra_pass else "regression",
+                    "provisional_outcome": "fix" if treatment_pass else "regression",
                     "manual_classification": None,
                     "manual_notes": None,
                     "direct_response": direct.get("response", ""),
-                    "isra_response": isra.get("response", ""),
+                    "treatment_response": treatment.get("response", ""),
                     "direct_evaluator_message": direct.get("evaluator_message"),
-                    "isra_evaluator_message": isra.get("evaluator_message"),
+                    "treatment_evaluator_message": treatment.get("evaluator_message"),
                 }
             )
 
-    both_pass = sum(direct and isra for direct, isra in completed_pairs)
-    direct_only = sum(direct and not isra for direct, isra in completed_pairs)
-    isra_only = sum(not direct and isra for direct, isra in completed_pairs)
-    both_fail = sum(not direct and not isra for direct, isra in completed_pairs)
-    n = len(completed_pairs)
-    delta = sum(int(isra) - int(direct) for direct, isra in completed_pairs) / n if n else None
-    ci = (
+    both_pass = sum(direct and treatment for direct, treatment in completed_pairs)
+    direct_only = sum(direct and not treatment for direct, treatment in completed_pairs)
+    treatment_only = sum(not direct and treatment for direct, treatment in completed_pairs)
+    both_fail = sum(not direct and not treatment for direct, treatment in completed_pairs)
+    pair_count = len(completed_pairs)
+    delta = (
+        sum(int(treatment) - int(direct) for direct, treatment in completed_pairs)
+        / pair_count
+        if pair_count
+        else None
+    )
+    interval = (
         paired_bootstrap_delta(
             completed_pairs, samples=bootstrap_samples, seed=bootstrap_seed
         )
@@ -133,21 +139,27 @@ def analyze(
     )
     summary = {
         "direct_variant": direct_variant,
-        "isra_variant": isra_variant,
-        "pair_count": n,
+        "treatment_variant": treatment_variant,
+        "pair_count": pair_count,
         "outcome_table": {
             "both_pass": both_pass,
             "direct_only_regressions": direct_only,
-            "isra_only_fixes": isra_only,
+            "treatment_only_fixes": treatment_only,
             "both_fail": both_fail,
         },
         "direct_accuracy": (
-            sum(direct for direct, _ in completed_pairs) / n if n else None
+            sum(direct for direct, _ in completed_pairs) / pair_count
+            if pair_count
+            else None
         ),
-        "isra_accuracy": sum(isra for _, isra in completed_pairs) / n if n else None,
+        "treatment_accuracy": (
+            sum(treatment for _, treatment in completed_pairs) / pair_count
+            if pair_count
+            else None
+        ),
         "paired_accuracy_delta": delta,
-        "paired_bootstrap_95pct_ci": list(ci),
-        "exact_mcnemar_two_sided_p": exact_mcnemar_p(isra_only, direct_only),
+        "paired_bootstrap_95pct_ci": list(interval),
+        "exact_mcnemar_two_sided_p": exact_mcnemar_p(treatment_only, direct_only),
         "status_counts": {
             variant: dict(Counter(record.get("status") for record in variant_records))
             for variant, variant_records in by_variant.items()
@@ -170,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("results", type=Path)
     parser.add_argument("--direct-variant", default="direct_greedy")
-    parser.add_argument("--isra-variant", default="isra_greedy")
+    parser.add_argument("--treatment-variant", default="spa_greedy")
     parser.add_argument("--bootstrap-samples", type=int, default=10_000)
     parser.add_argument("--bootstrap-seed", type=int, default=0)
     parser.add_argument("--output", type=Path)
@@ -184,15 +196,15 @@ def main() -> int:
     summary, disagreements = analyze(
         records,
         args.direct_variant,
-        args.isra_variant,
+        args.treatment_variant,
         args.bootstrap_samples,
         args.bootstrap_seed,
     )
     output = args.output or args.results.with_name(
-        f"analysis-{args.direct_variant}-vs-{args.isra_variant}.json"
+        f"analysis-{args.direct_variant}-vs-{args.treatment_variant}.json"
     )
     disagreement_path = args.disagreements or args.results.with_name(
-        f"disagreements-{args.direct_variant}-vs-{args.isra_variant}.jsonl"
+        f"disagreements-{args.direct_variant}-vs-{args.treatment_variant}.jsonl"
     )
     output.write_text(json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     disagreement_path.write_text(
