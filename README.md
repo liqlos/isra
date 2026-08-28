@@ -110,4 +110,4 @@ docs/EXPERIMENT_LOG.md             append-only experiment record
 Historical ISRA claims and code were removed from the working tree; the
 negative result remains documented and recoverable through Git history.
 
-Private repository. All rights reserved.
+All rights reserved.
